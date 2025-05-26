@@ -160,6 +160,28 @@ If the `-swarm-endpoint` flag is set, docker-gen will use the Docker Swarm API t
 
 Since the Swarm API is only exposed on the manager node, you should run docker-gen on the manager node of your Swarm cluster. The `-swarm-endpoint` flag should point to the manager's API endpoint, which is usually `tcp://<manager-ip>:2375` or `unix:///tmp/docker.sock`. When mounting the Docker socket, you should make sure that you set a placement constraint to run the container on the manager node, e.g. `--constraint 'node.role == manager'`.
 
+#### Container Notifications with Swarm
+
+Docker-gen fully supports notifying Swarm containers with the `-notify-container` and `-notify-filter` options. When the `-swarm-endpoint` flag is set, docker-gen will:
+
+1. Use the Swarm API to list and filter containers
+2. Send signals to containers managed by Swarm services
+3. Watch Swarm events to trigger template regeneration
+
+Example usage to notify containers matching specific labels in a Swarm environment:
+
+```console
+docker-gen -swarm-endpoint unix:///var/run/docker.sock -notify-filter "label=com.example.restart=true" -notify-signal 1 template.tmpl
+```
+
+This will send a SIGHUP (signal 1) to all containers with the label `com.example.restart=true` in the Swarm cluster whenever the template changes.
+
+For debugging Swarm container notifications, docker-gen now provides enhanced logging that shows:
+
+- Which client (Docker or Swarm) is being used for operations
+- Details about filtered containers in Swarm mode
+- Success or failure of sending signals to Swarm containers
+
 ### Configuration file
 
 Using the -config flag from above you can tell docker-gen to use the specified config file instead of command-line options. Multiple templates can be defined and they will be executed in the order that they appear in the config file.

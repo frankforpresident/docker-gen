@@ -244,8 +244,22 @@ func (g *generator) generateFromEvents() {
 		}(cfg)
 	}
 
+	// Watch regular Docker events
+	g.watchDockerEvents(watchers)
+
+	// If Swarm endpoint is configured, watch Swarm events as well
+	if g.SwarmEndpoint != "" && g.SwarmClient != nil {
+		g.watchSwarmEvents(watchers)
+	}
+}
+
+func (g *generator) watchDockerEvents(watchers []chan *docker.APIEvents) {
+	client := g.Client
+	
 	// maintains docker client connection and passes events to watchers
+	g.wg.Add(1)
 	go func() {
+		defer g.wg.Done()
 		// channel will be closed by go-dockerclient
 		eventChan := make(chan *docker.APIEvents, 100)
 		sigChan, cleanup := newSignalChannel()
@@ -344,6 +358,108 @@ func (g *generator) generateFromEvents() {
 	}()
 }
 
+func (g *generator) watchSwarmEvents(watchers []chan *docker.APIEvents) {
+	swarmClient := g.SwarmClient
+	
+	// maintains swarm client connection and passes events to watchers
+	g.wg.Add(1)
+	go func() {
+		defer g.wg.Done()
+		// channel will be closed by go-dockerclient
+		eventChan := make(chan *docker.APIEvents, 100)
+		sigChan, cleanup := newSignalChannel()
+		defer cleanup()
+
+		for {
+			watching := false
+
+			if swarmClient == nil {
+				var err error
+				endpoint, err := dockerclient.GetEndpoint(g.SwarmEndpoint)
+				if err != nil {
+					log.Printf("Bad swarm endpoint: %s", err)
+					time.Sleep(10 * time.Second)
+					continue
+				}
+				swarmClient, err = dockerclient.NewDockerClient(endpoint, g.TLSVerify, g.TLSCert, g.TLSCaCert, g.TLSKey)
+				if err != nil {
+					log.Printf("Unable to connect to docker swarm: %s", err)
+					time.Sleep(10 * time.Second)
+					continue
+				}
+				g.SwarmClient = swarmClient
+			}
+
+			for {
+				if swarmClient == nil {
+					break
+				}
+				if !watching {
+					options := docker.EventsOptions{
+						Filters: g.EventFilter,
+					}
+
+					err := swarmClient.AddEventListenerWithOptions(options, eventChan)
+					if err != nil && err != docker.ErrListenerAlreadyExists {
+						log.Printf("Error registering docker swarm event listener: %s", err)
+						time.Sleep(10 * time.Second)
+						continue
+					}
+					watching = true
+					log.Println("Watching docker swarm events")
+					// sync all configs after resuming listener
+					g.generateFromContainers()
+				}
+				select {
+				case event, ok := <-eventChan:
+					if !ok {
+						log.Printf("Docker swarm connection interrupted")
+						if watching {
+							swarmClient.RemoveEventListener(eventChan)
+							watching = false
+							swarmClient = nil
+							g.SwarmClient = nil
+						}
+						if !g.retry {
+							// exit but don't close watchers as they're shared with the docker events watcher
+							return
+						}
+						// recreate channel and attempt to resume
+						eventChan = make(chan *docker.APIEvents, 100)
+						time.Sleep(10 * time.Second)
+						break
+					}
+
+					log.Printf("Received swarm event %s for %s %s", event.Action, event.Type, event.Actor.ID[:12])
+					// fanout event to all watchers
+					for _, watcher := range watchers {
+						watcher <- event
+					}
+				case <-time.After(10 * time.Second):
+					// check for docker swarm liveness
+					err := swarmClient.Ping()
+					if err != nil {
+						log.Printf("Unable to ping docker swarm: %s", err)
+						if watching {
+							swarmClient.RemoveEventListener(eventChan)
+							watching = false
+							swarmClient = nil
+							g.SwarmClient = nil
+						}
+					}
+				case sig := <-sigChan:
+					log.Printf("Received signal in swarm watcher: %s\n", sig)
+					switch sig {
+					case syscall.SIGTERM, syscall.SIGINT:
+						// exit but don't close watchers as they're shared with the docker events watcher
+						return
+					}
+				}
+			}
+		}
+	}()
+}
+
 func (g *generator) runNotifyCmd(config config.Config) {
 	if config.NotifyCmd == "" {
 		return
@@ -365,19 +481,24 @@ func (g *generator) runNotifyCmd(config config.Config) {
 }
 
 func (g *generator) sendSignalToContainer(container string, signal int) {
-	log.Printf("Sending container '%s' signal '%v'", container, signal)
-
 	// Use the appropriate client (either the default Docker client or Swarm client)
 	client := g.Client
+	clientType := "standard Docker"
 	
 	// Use the Swarm client if we're in Swarm mode
 	if g.SwarmEndpoint != "" && g.SwarmClient != nil {
 		client = g.SwarmClient
+		clientType = "Docker Swarm"
 	}
+	
+	log.Printf("Sending container '%s' signal '%v' using %s client", container, signal, clientType)
 
 	if signal == -1 {
+		log.Printf("Restarting container '%s' using %s client", container, clientType)
 		if err := client.RestartContainer(container, 10); err != nil {
-			log.Printf("Error restarting container: %s", err)
+			log.Printf("Error restarting container '%s': %s", container, err)
+		} else {
+			log.Printf("Successfully restarted container '%s'", container)
 		}
 		return
 	}
@@ -386,8 +507,11 @@ func (g *generator) sendSignalToContainer(container string, signal int) {
 		ID:     container,
 		Signal: docker.Signal(signal),
 	}
+	log.Printf("Sending signal %v to container '%s' using %s client", docker.Signal(signal), container, clientType)
 	if err := client.KillContainer(killOpts); err != nil {
-		log.Printf("Error sending signal to container: %s", err)
+		log.Printf("Error sending signal %v to container '%s': %s", docker.Signal(signal), container, err)
+	} else {
+		log.Printf("Successfully sent signal %v to container '%s'", docker.Signal(signal), container)
 	}
 }
 
@@ -408,27 +532,36 @@ func (g *generator) sendSignalToFilteredContainers(config config.Config) {
 
 	// Determine which client to use - either the default Docker client or Swarm client
 	client := g.Client
+	clientType := "standard Docker"
 	
 	// Use the Swarm client if we're in Swarm mode
 	if g.SwarmEndpoint != "" && g.SwarmClient != nil {
 		client = g.SwarmClient
+		clientType = "Docker Swarm"
 	}
+	
+	log.Printf("Filtering containers with filters %v using %s client", config.NotifyContainersFilter, clientType)
 
 	containers, err := client.ListContainers(docker.ListContainersOptions{
 		Filters: config.NotifyContainersFilter,
 		All:     g.All,
 	})
 	if err != nil {
-		log.Printf("Error getting containers: %s", err)
+		log.Printf("Error getting containers with filters %v: %s", config.NotifyContainersFilter, err)
 		return
 	}
 
-	for _, container := range containers {
+	log.Printf("Found %d container(s) matching filters %v", len(containers), config.NotifyContainersFilter)
+	
+	for i, container := range containers {
+		log.Printf("Sending signal to filtered container %d/%d: ID=%s Name=%s", 
+			i+1, len(containers), container.ID[:12], strings.Join(container.Names, ", "))
 		g.sendSignalToContainer(container.ID, config.NotifyContainersSignal)
 	}
 }
 
 func (g *generator) GetSwarmContainers() ([]*context.RuntimeContainer, error) {
+	log.Printf("Getting containers from Swarm endpoint: %s", g.SwarmEndpoint)
 
 	if g.SwarmEndpoint == "" {
 		return nil, fmt.Errorf("swarm endpoint is not set, cannot get swarm containers")
@@ -436,8 +569,11 @@ func (g *generator) GetSwarmContainers() ([]*context.RuntimeContainer, error) {
 
 	// Use the existing SwarmClient
 	if g.SwarmClient == nil {
+		log.Printf("Swarm client is not initialized")
 		return nil, fmt.Errorf("swarm client is not initialized")
 	}
+	
+	log.Printf("Retrieving Docker Swarm server info")
 	
 	// Get API information for server details
 	apiInfo, err := g.SwarmClient.Info()
@@ -445,22 +581,34 @@ func (g *generator) GetSwarmContainers() ([]*context.RuntimeContainer, error) {
 		log.Printf("Error retrieving docker swarm server info: %s\n", err)
 	} else {
 		context.SetServerInfo(apiInfo)
+		log.Printf("Connected to Docker Swarm server: %s (version: %s)", apiInfo.Name, apiInfo.ServerVersion)
 	}
 	
+	log.Printf("Listing services from Swarm")
 	services, err := g.SwarmClient.ListServices(docker.ListServicesOptions{})
 	if err != nil {
+		log.Printf("Error listing services: %s", err)
 		return nil, err
 	}
+	log.Printf("Found %d services in Swarm", len(services))
+	
+	log.Printf("Listing networks from Swarm")
 	apiNetworks, err := g.SwarmClient.ListNetworks()
 	if err != nil {
+		log.Printf("Error listing networks: %s", err)
 		return nil, err
 	}
+	log.Printf("Found %d networks in Swarm", len(apiNetworks))
+	
 	networks := make(map[string]docker.Network)
 	for _, apiNetwork := range apiNetworks {
 		networks[apiNetwork.Name] = apiNetwork
 	}
+	
 	var containers []*context.RuntimeContainer
-	for _, service := range services {
+	for i, service := range services {
+		log.Printf("Processing service %d/%d: %s (ID: %s)", i+1, len(services), service.Spec.Name, service.ID[:12])
+		
 		tasks, err := g.SwarmClient.ListTasks(docker.ListTasksOptions{
 			Filters: map[string][]string{
 				"service": {service.ID},
@@ -468,17 +616,33 @@ func (g *generator) GetSwarmContainers() ([]*context.RuntimeContainer, error) {
 			},
 		})
 		if err != nil {
+			log.Printf("Error listing tasks for service %s: %s", service.Spec.Name, err)
 			continue
 		}
-		for _, task := range tasks {
-			if task.Status.ContainerStatus == nil || task.Status.ContainerStatus.ContainerID == "" {
+		log.Printf("Found %d running tasks for service %s", len(tasks), service.Spec.Name)
+		for taskIndex, task := range tasks {
+			log.Printf("Processing task %d/%d for service %s", taskIndex+1, len(tasks), service.Spec.Name)
+			
+			if task.Status.ContainerStatus == nil {
+				log.Printf("Task %s has no container status, skipping", task.ID[:12])
 				continue
 			}
+			
+			if task.Status.ContainerStatus.ContainerID == "" {
+				log.Printf("Task %s has empty container ID, skipping", task.ID[:12])
+				continue
+			}
+			
 			containerID := task.Status.ContainerStatus.ContainerID
+			log.Printf("Inspecting container %s for task %s", containerID[:12], task.ID[:12])
+			
 			container, err := g.SwarmClient.InspectContainer(containerID)
 			if err != nil {
+				log.Printf("Error inspecting container %s: %s", containerID[:12], err)
 				continue
 			}
+			
+			log.Printf("Successfully inspected container: %s (Name: %s)", containerID[:12], container.Name)
 			registry, repository, tag := dockerclient.SplitDockerImage(container.Config.Image)
 			runtimeContainer := &context.RuntimeContainer{
 				ID:      container.ID,
