@@ -28,6 +28,7 @@ FROM alpine:3.21.3
 
 ARG DOCKER_GEN_VERSION
 ENV DOCKER_GEN_VERSION=${DOCKER_GEN_VERSION} \
+	#FIXME: should be unix:///var/run/docker.sock instead of unix:///tmp/docker.sock ??? This would mean a breaking change...
     DOCKER_HOST=unix:///tmp/docker.sock
 
 # Install packages required by the image

@@ -40,6 +40,7 @@ var (
 	interval              int
 	keepBlankLines        bool
 	endpoint              string
+	swarmEndpoint         string
 	tlsCert               string
 	tlsKey                string
 	tlsCaCert             string
@@ -107,7 +108,6 @@ func initFlags() {
 	flag.BoolVar(&watch, "watch", false, "watch for container changes")
 	flag.StringVar(&wait, "wait", "", "minimum and maximum durations to wait (e.g. \"500ms:2s\") before triggering generate")
 	flag.BoolVar(&onlyExposed, "only-exposed", false, "only include containers with exposed ports")
-
 	flag.BoolVar(&onlyPublished, "only-published", false,
 		"only include containers with published ports (implies -only-exposed)")
 	flag.BoolVar(&includeStopped, "include-stopped", false, "include stopped containers")
@@ -124,12 +124,12 @@ func initFlags() {
 	flag.Var(&configFiles, "config", "config files with template directives. Config files will be merged if this option is specified multiple times.")
 	flag.IntVar(&interval, "interval", 0, "notify command interval (secs)")
 	flag.BoolVar(&keepBlankLines, "keep-blank-lines", false, "keep blank lines in the output file")
-	flag.StringVar(&endpoint, "endpoint", "", "docker api endpoint (tcp|unix://..). Default unix:///var/run/docker.sock")
+	flag.StringVar(&endpoint, "endpoint", "", "docker api endpoint (tcp|unix://..). Default unix:///tmp/docker.sock")
+	flag.StringVar(&swarmEndpoint, "swarm-endpoint", "", "docker swarm manager api endpoint (tcp|unix://..). If set, scrape all services and their containers from this endpoint.")
 	flag.StringVar(&tlsCert, "tlscert", filepath.Join(certPath, "cert.pem"), "path to TLS client certificate file")
 	flag.StringVar(&tlsKey, "tlskey", filepath.Join(certPath, "key.pem"), "path to TLS client key file")
 	flag.StringVar(&tlsCaCert, "tlscacert", filepath.Join(certPath, "ca.pem"), "path to TLS CA certificate file")
 	flag.BoolVar(&tlsVerify, "tlsverify", os.Getenv("DOCKER_TLS_VERIFY") != "", "verify docker daemon's TLS certicate")
-
 	flag.Var(&eventFilter, "event-filter",
 		"additional filter for event watched by docker-gen (e.g -event-filter event=connect -event-filter event=disconnect). You can pass this option multiple times to combine filters. By default docker-gen listen for container events start, stop, die and health_status. https://docs.docker.com/engine/reference/commandline/events/#filtering-events")
 
@@ -206,14 +206,15 @@ func main() {
 	}
 
 	generator, err := generator.NewGenerator(generator.GeneratorConfig{
-		Endpoint:    endpoint,
-		TLSKey:      tlsKey,
-		TLSCert:     tlsCert,
-		TLSCACert:   tlsCaCert,
-		TLSVerify:   tlsVerify,
-		All:         all,
-		EventFilter: eventFilter,
-		ConfigFile:  configs,
+		Endpoint:       endpoint,
+		SwarmEndpoint:  swarmEndpoint,
+		TLSKey:         tlsKey,
+		TLSCert:        tlsCert,
+		TLSCACert:      tlsCaCert,
+		TLSVerify:      tlsVerify,
+		All:            all,
+		EventFilter:    eventFilter,
+		ConfigFile:     configs,
 	})
 
 	if err != nil {

@@ -90,7 +90,9 @@ Options:
   -config value
       config files with template directives. Config files will be merged if this option is specified multiple times. (default [])
   -endpoint string
-      docker api endpoint (tcp|unix://..). Default unix:///var/run/docker.sock
+      docker api endpoint (tcp|unix://..). Default unix:///tmp/docker.sock
+  -swarm-endpoint string
+      docker swarm manager api endpoint (tcp|unix://..). If set, docker-gen uses the Docker Swarm API to retrieve container information.    
   -event-filter value
       additional filter for event watched by docker-gen (e.g -event-filter event=connect -event-filter event=disconnect).
       You can pass this option multiple times to combine filters.
@@ -151,6 +153,12 @@ Environment Variables:
 ```
 
 If no `<dest>` file is specified, the output is sent to stdout. Mainly useful for debugging.
+
+### Docker swarm
+
+If the `-swarm-endpoint` flag is set, docker-gen will use the Docker Swarm API to retrieve container information. This allows you to use docker-gen with Docker Swarm clusters.
+
+Since the Swarm API is only exposed on the manager node, you should run docker-gen on the manager node of your Swarm cluster. The `-swarm-endpoint` flag should point to the manager's API endpoint, which is usually `tcp://<manager-ip>:2375` or `unix:///tmp/docker.sock`. When mounting the Docker socket, you should make sure that you set a placement constraint to run the container on the manager node, e.g. `--constraint 'node.role == manager'`.
 
 ### Configuration file
 
