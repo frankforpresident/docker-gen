@@ -820,11 +820,12 @@ func (g *generator) GetSwarmContainers() ([]*context.RuntimeContainer, error) {
 			
 			container, err := g.SwarmClient.InspectContainer(containerID)
 			if err != nil {
-				log.Printf("Error inspecting container %s: %s", getIDPrefix(containerID), err)
-				continue
+				log.Printf("Warning: Cannot inspect container %s on remote node %s: %s - will use task information", getIDPrefix(containerID), nodeName, err)
+				// Container is on a different node, we'll create a RuntimeContainer from task info
+				container = nil
+			} else {
+				log.Printf("Successfully inspected container: %s (Name: %s)", getIDPrefix(containerID), container.Name)
 			}
-			
-			log.Printf("Successfully inspected container: %s (Name: %s)", getIDPrefix(containerID), container.Name)
 			// Using a more defensive approach for accessing container fields
 	var registry, repository, tag string
 	// containerID is already defined above
@@ -849,6 +850,7 @@ func (g *generator) GetSwarmContainers() ([]*context.RuntimeContainer, error) {
 		}()
 		
 		if container != nil {
+			// Extract from container inspection (local node)
 			containerID = container.ID
 			created = container.Created
 			
@@ -880,6 +882,45 @@ func (g *generator) GetSwarmContainers() ([]*context.RuntimeContainer, error) {
 			}
 			
 			addresses = context.GetContainerAddresses(container)
+		} else {
+			// Extract from Swarm task/service information (remote node)
+			// We have limited information but can still create a useful container object
+			containerID = getIDPrefix(task.Status.ContainerStatus.ContainerID)
+			
+			// Task created time
+			created = task.CreatedAt
+			
+			// Extract image information from task spec
+			if task.Spec.ContainerSpec != nil && task.Spec.ContainerSpec.Image != "" {
+				registry, repository, tag = dockerclient.SplitDockerImage(task.Spec.ContainerSpec.Image)
+				
+				// Extract hostname from container spec
+				if task.Spec.ContainerSpec.Hostname != "" {
+					hostname = task.Spec.ContainerSpec.Hostname
+				}
+				
+				// Extract labels from container spec
+				if task.Spec.ContainerSpec.Labels != nil {
+					labels = make(map[string]string)
+					for k, v := range task.Spec.ContainerSpec.Labels {
+						labels[k] = v
+					}
+				}
+			}
+			
+			// Check if task is running
+			if task.Status.State == "running" {
+				running = true
+			}
+			
+			// Generate a name from service name and task index/ID
+			if service.ID != "" {
+				name = fmt.Sprintf("%s.%s", service.Spec.Name, getIDPrefix(task.ID))
+			} else {
+				name = getIDPrefix(task.ID)
+			}
+			
+			log.Printf("Created container info from task data for remote container %s on node %s", getIDPrefix(containerID), nodeName)
 		}
 	}()
 	
