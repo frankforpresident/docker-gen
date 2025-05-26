@@ -19,6 +19,37 @@ import (
 	"github.com/nginx-proxy/docker-gen/internal/utils"
 )
 
+// Helper function to safely get ID prefix (first 12 chars) or the full ID if shorter
+func getIDPrefix(id string) string {
+	if len(id) > 12 {
+		return id[:12]
+	}
+	return id
+}
+
+// Helper function to safely get container health status
+func getContainerHealthStatus(container *docker.Container) string {
+	// The docker.Container struct's State.Health field might be zero-initialized
+	// We need to check if it's usable by using a defer/recover pattern
+	if container == nil {
+		return ""
+	}
+	
+	// Use a function with defer/recover to safely access potentially nil fields
+	var status string
+	func() {
+		defer func() {
+			// Recover from any panic that might occur when accessing nil fields
+			if r := recover(); r != nil {
+				status = ""
+			}
+		}()
+		status = container.State.Health.Status
+	}()
+	
+	return status
+}
+
 type generator struct {
 	Client                     *docker.Client
 	SwarmClient                *docker.Client
@@ -210,7 +241,6 @@ func (g *generator) generateFromEvents() {
 		return
 	}
 
-	client := g.Client
 	var watchers []chan *docker.APIEvents
 
 	for _, cfg := range configs.Config {
@@ -326,7 +356,7 @@ func (g *generator) watchDockerEvents(watchers []chan *docker.APIEvents) {
 						break
 					}
 
-					log.Printf("Received event %s for %s %s", event.Action, event.Type, event.Actor.ID[:12])
+					log.Printf("Received event %s for %s %s", event.Action, event.Type, getIDPrefix(event.Actor.ID))
 					// fanout event to all watchers
 					for _, watcher := range watchers {
 						watcher <- event
@@ -430,7 +460,7 @@ func (g *generator) watchSwarmEvents(watchers []chan *docker.APIEvents) {
 						break
 					}
 
-					log.Printf("Received swarm event %s for %s %s", event.Action, event.Type, event.Actor.ID[:12])
+					log.Printf("Received swarm event %s for %s %s", event.Action, event.Type, getIDPrefix(event.Actor.ID))
 					// fanout event to all watchers
 					for _, watcher := range watchers {
 						watcher <- event
@@ -555,7 +585,7 @@ func (g *generator) sendSignalToFilteredContainers(config config.Config) {
 	
 	for i, container := range containers {
 		log.Printf("Sending signal to filtered container %d/%d: ID=%s Name=%s", 
-			i+1, len(containers), container.ID[:12], strings.Join(container.Names, ", "))
+			i+1, len(containers), getIDPrefix(container.ID), strings.Join(container.Names, ", "))
 		g.sendSignalToContainer(container.ID, config.NotifyContainersSignal)
 	}
 }
@@ -607,7 +637,8 @@ func (g *generator) GetSwarmContainers() ([]*context.RuntimeContainer, error) {
 	
 	var containers []*context.RuntimeContainer
 	for i, service := range services {
-		log.Printf("Processing service %d/%d: %s (ID: %s)", i+1, len(services), service.Spec.Name, service.ID[:12])
+		serviceIDPrefix := getIDPrefix(service.ID)
+		log.Printf("Processing service %d/%d: %s (ID: %s)", i+1, len(services), service.Spec.Name, serviceIDPrefix)
 		
 		tasks, err := g.SwarmClient.ListTasks(docker.ListTasksOptions{
 			Filters: map[string][]string{
@@ -624,89 +655,183 @@ func (g *generator) GetSwarmContainers() ([]*context.RuntimeContainer, error) {
 			log.Printf("Processing task %d/%d for service %s", taskIndex+1, len(tasks), service.Spec.Name)
 			
 			if task.Status.ContainerStatus == nil {
-				log.Printf("Task %s has no container status, skipping", task.ID[:12])
+				log.Printf("Task %s has no container status, skipping", getIDPrefix(task.ID))
 				continue
 			}
 			
 			if task.Status.ContainerStatus.ContainerID == "" {
-				log.Printf("Task %s has empty container ID, skipping", task.ID[:12])
+				log.Printf("Task %s has empty container ID, skipping", getIDPrefix(task.ID))
 				continue
 			}
 			
 			containerID := task.Status.ContainerStatus.ContainerID
-			log.Printf("Inspecting container %s for task %s", containerID[:12], task.ID[:12])
+			
+			// Safely extract the node ID
+			nodeID := ""
+			if task.NodeID != "" {
+				nodeID = task.NodeID
+			}
+			log.Printf("Inspecting container %s for task %s", getIDPrefix(containerID), getIDPrefix(task.ID))
 			
 			container, err := g.SwarmClient.InspectContainer(containerID)
 			if err != nil {
-				log.Printf("Error inspecting container %s: %s", containerID[:12], err)
+				log.Printf("Error inspecting container %s: %s", getIDPrefix(containerID), err)
 				continue
 			}
 			
-			log.Printf("Successfully inspected container: %s (Name: %s)", containerID[:12], container.Name)
-			registry, repository, tag := dockerclient.SplitDockerImage(container.Config.Image)
-			runtimeContainer := &context.RuntimeContainer{
-				ID:      container.ID,
-				Created: container.Created,
-				Image: context.DockerImage{
-					Registry:   registry,
-					Repository: repository,
-					Tag:        tag,
-				},
-				State: context.State{
-					Running: container.State.Running,
-					Health: context.Health{
-						Status: container.State.Health.Status,
-					},
-				},
-				Name:         strings.TrimLeft(container.Name, "/"),
-				Hostname:     container.Config.Hostname,
-				Gateway:      container.NetworkSettings.Gateway,
-				NetworkMode:  container.HostConfig.NetworkMode,
-				Addresses:    context.GetContainerAddresses(container),
-				Networks:     []context.Network{},
-				Env:          make(map[string]string),
-				Volumes:      make(map[string]context.Volume),
-				Node: context.SwarmNode{
-					ID:   task.NodeID,
-				},
-				Labels:       container.Config.Labels,
-				IP:           container.NetworkSettings.IPAddress,
-				IP6LinkLocal: container.NetworkSettings.LinkLocalIPv6Address,
-				IP6Global:    container.NetworkSettings.GlobalIPv6Address,
+			log.Printf("Successfully inspected container: %s (Name: %s)", getIDPrefix(containerID), container.Name)
+			// Using a more defensive approach for accessing container fields
+	var registry, repository, tag string
+	// containerID is already defined above
+	var created time.Time
+	var running bool
+	var name string
+	var hostname string
+	var gateway string
+	var networkMode string
+	var addresses []context.Address
+	var labels = make(map[string]string) // Initialize to empty map to avoid nil
+	var ipAddress string
+	var ip6LinkLocal string
+	var ip6Global string
+	
+	// Safely extract all values using defer/recover pattern
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				// Just recover and continue with default values
 			}
-			for k, v := range container.NetworkSettings.Networks {
-				network := context.Network{
-					IP:                  v.IPAddress,
-					Name:                k,
-					Gateway:             v.Gateway,
-					EndpointID:          v.EndpointID,
-					IPv6Gateway:         v.IPv6Gateway,
-					GlobalIPv6Address:   v.GlobalIPv6Address,
-					MacAddress:          v.MacAddress,
-					GlobalIPv6PrefixLen: v.GlobalIPv6PrefixLen,
-					IPPrefixLen:         v.IPPrefixLen,
-					Internal:            networks[k].Internal,
-				}
-				runtimeContainer.Networks = append(runtimeContainer.Networks, network)
-			}
-			for k, v := range container.Volumes {
-				runtimeContainer.Volumes[k] = context.Volume{
-					Path:      k,
-					HostPath:  v,
-					ReadWrite: container.VolumesRW[k],
+		}()
+		
+		if container != nil {
+			containerID = container.ID
+			created = container.Created
+			
+			if container.Config != nil {
+				registry, repository, tag = dockerclient.SplitDockerImage(container.Config.Image)
+				hostname = container.Config.Hostname
+				if container.Config.Labels != nil {
+					labels = container.Config.Labels
 				}
 			}
-			for _, v := range container.Mounts {
-				runtimeContainer.Mounts = append(runtimeContainer.Mounts, context.Mount{
-					Name:        v.Name,
-					Source:      v.Source,
-					Destination: v.Destination,
-					Driver:      v.Driver,
-					Mode:        v.Mode,
-					RW:          v.RW,
-				})
+			
+			if container.State.Running {
+				running = true
 			}
-			runtimeContainer.Env = utils.SplitKeyValueSlice(container.Config.Env)
+			
+			if container.Name != "" {
+				name = strings.TrimLeft(container.Name, "/")
+			}
+			
+			if container.NetworkSettings != nil {
+				gateway = container.NetworkSettings.Gateway
+				ipAddress = container.NetworkSettings.IPAddress
+				ip6LinkLocal = container.NetworkSettings.LinkLocalIPv6Address
+				ip6Global = container.NetworkSettings.GlobalIPv6Address
+			}
+			
+			if container.HostConfig != nil {
+				networkMode = container.HostConfig.NetworkMode
+			}
+			
+			addresses = context.GetContainerAddresses(container)
+		}
+	}()
+	
+	// Create the runtime container
+	runtimeContainer := &context.RuntimeContainer{
+		ID:      containerID,
+		Created: created,
+		Image: context.DockerImage{
+			Registry:   registry,
+			Repository: repository,
+			Tag:        tag,
+		},
+		State: context.State{
+			Running: running,
+			Health: context.Health{
+				Status: getContainerHealthStatus(container),
+			},
+		},
+		Name:         name,
+		Hostname:     hostname,
+		Gateway:      gateway,
+		NetworkMode:  networkMode,
+		Addresses:    addresses,
+		Networks:     []context.Network{},
+		Env:          make(map[string]string),
+		Volumes:      make(map[string]context.Volume),
+		Node: context.SwarmNode{
+			ID:   nodeID,
+			Name: nodeID, // Default to NodeID if name not available
+			Address: context.Address{
+				// We don't have access to the Node's IP directly from the task
+				// We could add a call to inspect the node if needed
+			},
+		},
+		Labels:       labels, // This is already safely extracted in the deferred function
+		IP:           ipAddress,
+		IP6LinkLocal: ip6LinkLocal,
+		IP6Global:    ip6Global,
+	}
+			// Safely iterate over networks with nil check
+			if container != nil && container.NetworkSettings != nil && container.NetworkSettings.Networks != nil {
+				for k, v := range container.NetworkSettings.Networks {
+					// Make sure the network exists in our networks map
+					networkInternal := false
+					if net, exists := networks[k]; exists {
+						networkInternal = net.Internal
+					}
+					
+					network := context.Network{
+						IP:                  v.IPAddress,
+						Name:                k,
+						Gateway:             v.Gateway,
+						EndpointID:          v.EndpointID,
+						IPv6Gateway:         v.IPv6Gateway,
+						GlobalIPv6Address:   v.GlobalIPv6Address,
+						MacAddress:          v.MacAddress,
+						GlobalIPv6PrefixLen: v.GlobalIPv6PrefixLen,
+						IPPrefixLen:         v.IPPrefixLen,
+						Internal:            networkInternal,
+					}
+					runtimeContainer.Networks = append(runtimeContainer.Networks, network)
+				}
+			}
+			// Safely iterate over volumes with nil checks
+			if container != nil && container.Volumes != nil && container.VolumesRW != nil {
+				for k, v := range container.Volumes {
+					// Check if the key exists in VolumesRW map
+					readWrite := false
+					if rw, exists := container.VolumesRW[k]; exists {
+						readWrite = rw
+					}
+					
+					runtimeContainer.Volumes[k] = context.Volume{
+						Path:      k,
+						HostPath:  v,
+						ReadWrite: readWrite,
+					}
+				}
+			}
+			// Safely iterate over mounts with nil check
+			if container != nil && container.Mounts != nil {
+				for _, v := range container.Mounts {
+					runtimeContainer.Mounts = append(runtimeContainer.Mounts, context.Mount{
+						Name:        v.Name,
+						Source:      v.Source,
+						Destination: v.Destination,
+						Driver:      v.Driver,
+						Mode:        v.Mode,
+						RW:          v.RW,
+					})
+				}
+			}
+			
+			// Safely set environment variables
+			if container != nil && container.Config != nil && container.Config.Env != nil {
+				runtimeContainer.Env = utils.SplitKeyValueSlice(container.Config.Env)
+			}
 			containers = append(containers, runtimeContainer)
 		}
 	}
@@ -753,34 +878,84 @@ func (g *generator) getContainers() ([]*context.RuntimeContainer, error) {
 			continue
 		}
 
-		registry, repository, tag := dockerclient.SplitDockerImage(container.Config.Image)
+		// Using a more defensive approach for accessing container fields
+		var registry, repository, tag string
+		var containerID string
+		var created time.Time
+		var running bool
+		var name string
+		var hostname string
+		var gateway string
+		var networkMode string
+		var ipAddress string
+		var ip6LinkLocal string
+		var ip6Global string
+		
+		// Safely extract all values using defer/recover pattern
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					// Just recover and continue with default values
+				}
+			}()
+			
+			if container != nil {
+				containerID = container.ID
+				created = container.Created
+				
+				if container.Config != nil {
+					registry, repository, tag = dockerclient.SplitDockerImage(container.Config.Image)
+					hostname = container.Config.Hostname
+				}
+				
+				if container.State.Running {
+					running = true
+				}
+				
+				if container.Name != "" {
+					name = strings.TrimLeft(container.Name, "/")
+				}
+				
+				if container.NetworkSettings != nil {
+					gateway = container.NetworkSettings.Gateway
+					ipAddress = container.NetworkSettings.IPAddress
+					ip6LinkLocal = container.NetworkSettings.LinkLocalIPv6Address
+					ip6Global = container.NetworkSettings.GlobalIPv6Address
+				}
+				
+				if container.HostConfig != nil {
+					networkMode = container.HostConfig.NetworkMode
+				}
+			}
+		}()
+		
 		runtimeContainer := &context.RuntimeContainer{
-			ID:      container.ID,
-			Created: container.Created,
+			ID:      containerID,
+			Created: created,
 			Image: context.DockerImage{
 				Registry:   registry,
 				Repository: repository,
 				Tag:        tag,
 			},
 			State: context.State{
-				Running: container.State.Running,
+				Running: running,
 				Health: context.Health{
-					Status: container.State.Health.Status,
+					Status: getContainerHealthStatus(container),
 				},
 			},
-			Name:         strings.TrimLeft(container.Name, "/"),
-			Hostname:     container.Config.Hostname,
-			Gateway:      container.NetworkSettings.Gateway,
-			NetworkMode:  container.HostConfig.NetworkMode,
+			Name:         name,
+			Hostname:     hostname,
+			Gateway:      gateway,
+			NetworkMode:  networkMode,
 			Addresses:    []context.Address{},
 			Networks:     []context.Network{},
 			Env:          make(map[string]string),
 			Volumes:      make(map[string]context.Volume),
 			Node:         context.SwarmNode{},
 			Labels:       make(map[string]string),
-			IP:           container.NetworkSettings.IPAddress,
-			IP6LinkLocal: container.NetworkSettings.LinkLocalIPv6Address,
-			IP6Global:    container.NetworkSettings.GlobalIPv6Address,
+			IP:           ipAddress,
+			IP6LinkLocal: ip6LinkLocal,
+			IP6Global:    ip6Global,
 		}
 
 		adresses := context.GetContainerAddresses(container)
