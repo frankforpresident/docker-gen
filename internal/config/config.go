@@ -21,6 +21,7 @@ type Config struct {
 	IncludeStopped         bool
 	Interval               int
 	KeepBlankLines         bool
+	SwarmRefreshInterval   time.Duration // Configurable interval for Swarm periodic refresh (default: 30s)
 }
 
 type ConfigFile struct {

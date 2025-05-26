@@ -508,7 +508,17 @@ func (g *generator) watchSwarmEvents(watchers []chan *docker.APIEvents) {
 					// Start a periodic refresh timer to catch any missed events
 					// This helps ensure we catch changes on remote nodes even if events are missed
 					go func() {
-						ticker := time.NewTicker(30 * time.Second)
+						// Get configurable refresh interval from the first config that has it set
+						refreshInterval := 30 * time.Second // Default value
+						for _, cfg := range g.Configs.Config {
+							if cfg.SwarmRefreshInterval > 0 {
+								refreshInterval = cfg.SwarmRefreshInterval
+								break
+							}
+						}
+						
+						log.Printf("Starting Swarm periodic refresh with interval: %v", refreshInterval)
+						ticker := time.NewTicker(refreshInterval)
 						defer ticker.Stop()
 						
 						for {
