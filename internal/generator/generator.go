@@ -133,6 +133,11 @@ func NewGenerator(gc GeneratorConfig) (*generator, error) {
 }
 
 func (g *generator) Generate() error {
+	// If we're in Swarm mode, pre-fetch nodes information for better context
+	if g.SwarmEndpoint != "" && g.SwarmClient != nil {
+		go g.refreshSwarmNodeInfo()
+	}
+	
 	g.generateFromContainers()
 	g.generateAtInterval()
 	g.generateFromEvents()
@@ -140,6 +145,52 @@ func (g *generator) Generate() error {
 	g.wg.Wait()
 
 	return nil
+}
+
+// refreshSwarmNodeInfo fetches information about all nodes in the Swarm cluster
+// and logs useful diagnostic information
+func (g *generator) refreshSwarmNodeInfo() {
+	if g.SwarmClient == nil {
+		log.Println("Swarm client not initialized, can't refresh node info")
+		return
+	}
+
+	nodes, err := g.SwarmClient.ListNodes(docker.ListNodesOptions{})
+	if err != nil {
+		log.Printf("Error listing Swarm nodes: %s", err)
+		return
+	}
+
+	log.Printf("Swarm cluster has %d nodes", len(nodes))
+	for i, node := range nodes {
+		hostname := "unknown"
+		if node.Description.Hostname != "" {
+			hostname = node.Description.Hostname
+		}
+		
+		status := "unknown"
+		if node.Status.State != "" {
+			status = string(node.Status.State)
+		}
+		
+		role := "unknown"
+		if node.Spec.Role != "" {
+			role = string(node.Spec.Role)
+		}
+		
+		availability := "unknown"
+		if node.Spec.Availability != "" {
+			availability = string(node.Spec.Availability)
+		}
+		
+		isManager := "false"
+		if node.ManagerStatus != nil {
+			isManager = "true"
+		}
+		
+		log.Printf("Node %d: ID=%s, Hostname=%s, Role=%s, Availability=%s, Status=%s, Manager=%s", 
+			i+1, getIDPrefix(node.ID), hostname, role, availability, status, isManager)
+	}
 }
 
 func (g *generator) generateFromSignals() {
@@ -391,7 +442,10 @@ func (g *generator) watchDockerEvents(watchers []chan *docker.APIEvents) {
 func (g *generator) watchSwarmEvents(watchers []chan *docker.APIEvents) {
 	swarmClient := g.SwarmClient
 	
-	// maintains swarm client connection and passes events to watchers
+	// maintains swarm client connection and passes events to watchers from all nodes
+	// Note: Docker Swarm events can only be reliably watched from a manager node,
+	// as Swarm nodes only emit events to the managers. This is why docker-gen
+	// must run on a manager node to watch events from all nodes in the cluster.
 	g.wg.Add(1)
 	go func() {
 		defer g.wg.Done()
@@ -425,10 +479,21 @@ func (g *generator) watchSwarmEvents(watchers []chan *docker.APIEvents) {
 					break
 				}
 				if !watching {
+					// Create a copy of the event filters
+					swarmFilters := make(map[string][]string)
+					for k, v := range g.EventFilter {
+						swarmFilters[k] = make([]string, len(v))
+						copy(swarmFilters[k], v)
+					}
+					
+					// Add the swarm=true filter to ensure we get events from all swarm nodes
+					swarmFilters["swarm"] = []string{"true"}
+					
 					options := docker.EventsOptions{
-						Filters: g.EventFilter,
+						Filters: swarmFilters,
 					}
 
+					log.Printf("Setting up Swarm event listener with filters: %v", swarmFilters)
 					err := swarmClient.AddEventListenerWithOptions(options, eventChan)
 					if err != nil && err != docker.ErrListenerAlreadyExists {
 						log.Printf("Error registering docker swarm event listener: %s", err)
@@ -439,6 +504,24 @@ func (g *generator) watchSwarmEvents(watchers []chan *docker.APIEvents) {
 					log.Println("Watching docker swarm events")
 					// sync all configs after resuming listener
 					g.generateFromContainers()
+					
+					// Start a periodic refresh timer to catch any missed events
+					// This helps ensure we catch changes on remote nodes even if events are missed
+					go func() {
+						ticker := time.NewTicker(30 * time.Second)
+						defer ticker.Stop()
+						
+						for {
+							select {
+							case <-ticker.C:
+								log.Println("Performing periodic Swarm container refresh")
+								g.generateFromContainers()
+							case <-time.After(60 * time.Second):
+								// Exit if the main loop is gone
+								return
+							}
+						}
+					}()
 				}
 				select {
 				case event, ok := <-eventChan:
@@ -460,7 +543,39 @@ func (g *generator) watchSwarmEvents(watchers []chan *docker.APIEvents) {
 						break
 					}
 
-					log.Printf("Received swarm event %s for %s %s", event.Action, event.Type, getIDPrefix(event.Actor.ID))
+					// Extract node information if available
+					nodeID := "unknown"
+					containerID := "n/a"
+					serviceID := "n/a"
+					
+					if nodeAttr, exists := event.Actor.Attributes["com.docker.swarm.node.id"]; exists {
+						nodeID = nodeAttr
+					}
+					
+					// Extract container ID if this is a container event
+					if event.Type == "container" {
+						containerID = event.Actor.ID
+					}
+					
+					// Extract service ID if available
+					if serviceAttr, exists := event.Actor.Attributes["com.docker.swarm.service.id"]; exists {
+						serviceID = serviceAttr
+					}
+					
+					log.Printf("Received swarm event %s for %s %s (Node: %s, Service: %s)",
+						event.Action, event.Type, getIDPrefix(event.Actor.ID), nodeID, serviceID)
+					
+					// Log additional attributes for debugging
+					if len(event.Actor.Attributes) > 0 {
+						log.Printf("Swarm event attributes: %v", event.Actor.Attributes)
+					}
+					
+					// If this is a container event on a remote node, show extra information
+					if event.Type == "container" && nodeID != "unknown" && nodeID != "" {
+						log.Printf("Container event from remote node %s: %s action on container %s",
+							nodeID, event.Action, getIDPrefix(containerID))
+					}
+					
 					// fanout event to all watchers
 					for _, watcher := range watchers {
 						watcher <- event
@@ -666,12 +781,32 @@ func (g *generator) GetSwarmContainers() ([]*context.RuntimeContainer, error) {
 			
 			containerID := task.Status.ContainerStatus.ContainerID
 			
-			// Safely extract the node ID
+			// Safely extract the node ID and attempt to get node name
 			nodeID := ""
+			nodeName := ""
+			
 			if task.NodeID != "" {
 				nodeID = task.NodeID
+				
+				// Attempt to get more information about the node
+				node, err := g.SwarmClient.InspectNode(nodeID)
+				if err != nil {
+					log.Printf("Error inspecting node %s: %s - will use ID as name", nodeID, err)
+					nodeName = nodeID // Fallback to ID if we can't get the name
+				} else {
+					// Extract the node's hostname (usually more user-friendly than ID)
+					if node.Description.Hostname != "" {
+						nodeName = node.Description.Hostname
+					} else if node.Spec.Name != "" {
+						nodeName = node.Spec.Name
+					} else {
+						nodeName = nodeID // Fallback to ID
+					}
+					log.Printf("Resolved node %s to hostname %s", nodeID, nodeName)
+				}
 			}
-			log.Printf("Inspecting container %s for task %s", getIDPrefix(containerID), getIDPrefix(task.ID))
+			
+			log.Printf("Inspecting container %s for task %s on node %s", getIDPrefix(containerID), getIDPrefix(task.ID), nodeName)
 			
 			container, err := g.SwarmClient.InspectContainer(containerID)
 			if err != nil {
@@ -763,10 +898,10 @@ func (g *generator) GetSwarmContainers() ([]*context.RuntimeContainer, error) {
 		Volumes:      make(map[string]context.Volume),
 		Node: context.SwarmNode{
 			ID:   nodeID,
-			Name: nodeID, // Default to NodeID if name not available
+			Name: nodeName, // We now have the actual node name from our lookup
 			Address: context.Address{
-				// We don't have access to the Node's IP directly from the task
-				// We could add a call to inspect the node if needed
+				// We could add more node address information here if needed
+				// For now, it's sufficient to have the ID and name
 			},
 		},
 		Labels:       labels, // This is already safely extracted in the deferred function

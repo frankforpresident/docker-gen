@@ -36,7 +36,10 @@ var (
 	includeStopped        bool
 	configFiles           stringslice
 	configs               config.ConfigFile
-	eventFilter           mapstringslice = mapstringslice{"event": {"start", "stop", "die", "health_status"}}
+	eventFilter           mapstringslice = mapstringslice{
+		"event": {"start", "stop", "die", "health_status"},
+		"type":  {"container", "service"}, // Include service events for Swarm
+	}
 	interval              int
 	keepBlankLines        bool
 	endpoint              string
@@ -125,7 +128,7 @@ func initFlags() {
 	flag.IntVar(&interval, "interval", 0, "notify command interval (secs)")
 	flag.BoolVar(&keepBlankLines, "keep-blank-lines", false, "keep blank lines in the output file")
 	flag.StringVar(&endpoint, "endpoint", "", "docker api endpoint (tcp|unix://..). Default unix:///tmp/docker.sock")
-	flag.StringVar(&swarmEndpoint, "swarm-endpoint", "", "docker swarm manager api endpoint (tcp|unix://..). If set, scrape all services and their containers from this endpoint.")
+	flag.StringVar(&swarmEndpoint, "swarm-endpoint", "", "docker swarm manager api endpoint (tcp|unix://..). IMPORTANT: Must be run on a manager node to receive events from all nodes in the cluster. Docker Swarm only forwards events to manager nodes.")
 	flag.StringVar(&tlsCert, "tlscert", filepath.Join(certPath, "cert.pem"), "path to TLS client certificate file")
 	flag.StringVar(&tlsKey, "tlskey", filepath.Join(certPath, "key.pem"), "path to TLS client key file")
 	flag.StringVar(&tlsCaCert, "tlscacert", filepath.Join(certPath, "ca.pem"), "path to TLS CA certificate file")
